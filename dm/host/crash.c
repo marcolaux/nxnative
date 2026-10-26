@@ -151,7 +151,22 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     }
     funlockfile(stderr);
     fprintf(stderr, "[dm] CRASH sig=%d", sig);
-    off("addr", (uint64_t)si->si_addr); off("pc", uc->uc_mcontext->__ss.__pc); off("lr", uc->uc_mcontext->__ss.__lr);
+    off("addr", (uint64_t)si->si_addr);
+    fprintf(stderr, " (%s)", (int)((uc->uc_mcontext->__es.__esr >> 6) & 1) ? "write" : "read");
+    // The protection of the page the fault hit on: a write fault on a writable page cannot happen, so this names the mechanism when it is not writable --
+    // read-only: the graphics layer's dirty-page write protection (nvn_dirty) or a read from a host-protected code page; no access: heap pages beyond SetHeapSize, unmapped
+    // MapPhysicalMemory pages, or an unmapped address. On macOS a VM region is also reported when protection excludes the access, so "read-only" distinguishes the two
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        vm_address_t ra = (vm_address_t)si->si_addr; vm_size_t rs = 0; vm_region_basic_info_data_64_t vi;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&vi, &cnt, &obj);
+        if (kr == KERN_SUCCESS)
+            fprintf(stderr, ", page protection %d (%s), region %#llx+%#llx", vi.protection,
+                    vi.protection & VM_PROT_WRITE ? "writable" : vi.protection & VM_PROT_READ ? "read-only" : "no access",
+                    (unsigned long long)ra, (unsigned long long)rs);
+        else fprintf(stderr, ", no VM region (unmapped)");
+    }
+    off("pc", uc->uc_mcontext->__ss.__pc); off("lr", uc->uc_mcontext->__ss.__lr);
     fprintf(stderr, " sp=%#llx\n", uc->uc_mcontext->__ss.__sp);
     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, uc->uc_mcontext->__ss.__x[i], i % 6 == 5 ? "\n" : " ");
     fprintf(stderr, "\n");

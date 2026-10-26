@@ -283,6 +283,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (rc) die("SetHeapSize mprotect failed: req=%#zx errno=%d", size, errno);
         if (g_flag.svc) LOG("SetHeapSize %#zx -> base %p mprotect=%d errno=%d", size, g_heap, rc, errno);
         else if (size > g_heap_cur) LOG("[mem] heap %.2f GB (heap region %.2f GB)", size / 1073741824.0, g_heap_cap / 1073741824.0);
+        else if (size < previous && previous) LOG("[mem] heap shrank %.2f GB -> %.2f GB (region %.2f GB; the tail is now PROT_NONE, an allocator that kept pages there will fault)", previous / 1073741824.0, size / 1073741824.0, g_heap_cap / 1073741824.0);
         g_heap_cur = size;
         pthread_mutex_unlock(&g_map_lock);
         regs[0] = 0; regs[1] = (uint64_t)g_heap; return 0;

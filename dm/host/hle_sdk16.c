@@ -2,8 +2,10 @@
 // On the real device all of these go through Horizon system services (IPC); the host gives values directly or makes them "unavailable".
 #include "hle.h"
 #include <fcntl.h>
+#include <mach/mach.h>
 #include <pthread.h>
 #include <pthread/qos.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -268,6 +270,70 @@ HLE_FORCE("_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7Displa
 // The text after LogMetaData (NN_LOG) goes straight into the host log; an abort prints the call site and exits with a failure
 HLE_FORCE("_ZN2nn4diag6detail7PutImplERKNS0_11LogMetaDataEPKcm", "game log → host log", void, h_diag_Put, const void *meta, const char *s, size_t n) {
     (void)meta; while (n && (s[n - 1] == '\n' || s[n - 1] == '\0')) n--; if (n) LOG("[game] %.*s", (int)n, s);
+}
+// SDK 4.x shape of the same entry (UE's SwitchPlatformMisc::LocalPrint reaches it via LogImpl): metadata ref, format string, varargs.
+// The varargs are captured as parameters (x2..x7): Switch passes trailing arguments in the core registers (AAPCS64 varargs never use SIMD), while the host compiler would look for them
+// on the stack — expanding them with the host's vsnprintf crashed (run 8, sig=10 in __vfprintf: guest %ls arguments read as garbage). Formatted here instead: the %s/%ls arguments are guest
+// strings (UE TCHAR is UTF-16LE on the Switch; diagnostics also pass UTF-8 bytes), decoded with a safe reader (vm_read_overwrite only, no faulting, no host string functions on guest data);
+// anything the decoder cannot make out becomes a hex dump. Conversions beyond the six register arguments are noted, not guessed.
+static void diag_gstr(char *out, size_t cap, uint64_t p) {
+    out[0] = 0; if (!p) { snprintf(out, cap, "<null>"); return; }
+    uint8_t b[256]; vm_size_t got = 0;
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)p, sizeof b, (vm_address_t)b, &got) != KERN_SUCCESS || got < 2) { snprintf(out, cap, "<ptr %#llx unreadable>", (unsigned long long)p); return; }
+    // UTF-16LE when the low byte starts a character and the next byte is 0 (as 8-bit text the string would be empty); pairs run until the 00 00 terminator
+    if (b[0] && b[1] == 0) {
+        size_t n = 0; while (n + 1 < got && (b[n] || b[n + 1])) n += 2;
+        if (n + 2 > got) { snprintf(out, cap, "<utf16 no terminator @%#llx>", (unsigned long long)p); return; }
+        size_t o = 0;
+        for (size_t i = 0; i < n && o + 4 < cap; i += 2) {
+            unsigned ch = b[i] | (b[i + 1] << 8);
+            if (ch < 0x80) out[o++] = (char)(ch ? (char)ch : '?');
+            else if (ch < 0x800) { out[o++] = (char)(0xC0 | (ch >> 6)); out[o++] = (char)(0x80 | (ch & 0x3F)); }
+        }
+        out[o] = 0; return;
+    }
+    size_t n = 0; while (n < got && b[n]) n++;
+    if (!n) { snprintf(out, cap, "<empty>"); return; }
+    if (n == got) n = 96;   // no terminator in the window: cap below, mark nothing (still safer than guessing)
+    int printable = 1;
+    for (size_t i = 0; i < n && i < 96; i++) if ((b[i] < 0x20 && b[i] != '\t' && b[i] != '\n' && b[i] != '\r')) printable = 0;
+    if (printable && cap > n) { memcpy(out, b, n < cap - 1 ? n : cap - 1); out[n < cap - 1 ? n : cap - 1] = 0; return; }
+    char *q = out; size_t left = cap; *q = 0;
+    for (size_t i = 0; i < 24 && left > 3; i++) { int w = snprintf(q, left, "%02x", b[i]); if (w < 0) break; q += w; left -= (size_t)w; }
+}
+HLE_FORCE("_ZN2nn4diag6detail7LogImplERKNS0_11LogMetaDataEPKcz", "game log → host log (SDK 4 format form)", void, h_diag_Log, const void *meta, const char *fmt,
+          uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)meta; if (!fmt) return;
+    uint64_t args[6] = {a0, a1, a2, a3, a4, a5};
+    int k = 0;   // consumed arguments (the six register slots; a conversion beyond them is noted, not guessed)
+    char buf[1024]; size_t o = 0;
+    for (const char *s = fmt; *s && (int)o < (int)sizeof buf - 232; s++) {
+        if (*s != '%') { buf[o++] = *s; continue; }
+        const char *c = s + 1;
+        if (*c == '%') { buf[o++] = '%'; s++; continue; }
+        while (*c && !strchr("csdxXufp", *c)) c++;   // skip flags/width/precision/length to the conversion letter
+        if (!*c) { o = 0; break; }
+        char cv = *c; s = c;
+        if (k >= 6) { o += (size_t)snprintf(buf + o, sizeof buf - o, "<arg %d>", k + 1); k++; continue; }
+        char piece[112]; piece[0] = 0;
+        switch (cv) {
+        case 's': diag_gstr(piece, sizeof piece, args[k]); break;
+        case 'd': snprintf(piece, sizeof piece, "%lld", (long long)args[k]); break;
+        case 'u': snprintf(piece, sizeof piece, "%llu", (unsigned long long)args[k]); break;
+        case 'x': snprintf(piece, sizeof piece, "%llx", (unsigned long long)args[k]); break;
+        case 'X': snprintf(piece, sizeof piece, "%llX", (unsigned long long)args[k]); break;
+        case 'p': snprintf(piece, sizeof piece, "%#llx", (unsigned long long)args[k]); break;
+        case 'f': { union { uint64_t u; double d; } v = { args[k] }; snprintf(piece, sizeof piece, "%.7g", v.d); } break;
+        case 'c': { unsigned ch = (unsigned)(args[k] & 0xff); if (ch >= 0x20 && ch < 0x7f) snprintf(piece, sizeof piece, "%c", (char)ch);
+                    else snprintf(piece, sizeof piece, "\\x%02x", ch); } break;
+        default: snprintf(piece, sizeof piece, "<%%%c>", cv); break;
+        }
+        k++;
+        o += (size_t)snprintf(buf + o, sizeof buf - o, "%s", piece);
+    }
+    while (o && (buf[o - 1] == '\n' || buf[o - 1] == '\0')) o--;
+    if (k > 6) LOG("[game] %.*s [+]", (int)o, buf);
+    else if (o) LOG("[game] %.*s", (int)o, buf);
 }
 // Abort: report the call site (module + offset) and the guest backtrace, then exit
 static void diag_abort(uint32_t res, void *lr) {

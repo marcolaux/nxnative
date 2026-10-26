@@ -153,8 +153,18 @@ static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn) {
     if (g_nprobe >= MAX_PROBE) die("too many probes");
     if (!g_slots) g_slots = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     uint64_t at = (uint64_t)m->base + off;
-    uint32_t *w = (uint32_t *)at, *sl = g_slots + g_nprobe * 8;
-    sl[0] = *w;                                  // Original instruction
+    uint32_t *w = (uint32_t *)at, *sl = g_slots + g_nprobe * 8, op = *w;
+    // the slot re-locates the original instruction, so a pc-relative one (branch, ADR, literal load) cannot be probed: it keeps its old target from the slot's own address
+    const char *preloc = (op & 0x7C000000) == 0x14000000 ? "b/bl" :
+                         (op & 0xFF000010) == 0x54000000 ? "b.cond" :
+                         (op & 0x7E000000) == 0x34000000 ? "cbz/cbnz" :
+                         (op & 0x7E000000) == 0x36000000 ? "tbz/tbnz" :
+                         (op & 0x7F000000) == 0x10000000 ? "adr/adrp" :
+                         ((op & 0x3F000000) == 0x18000000 ||   // LDR (literal) incl. LDRSW (literal)
+                          (op & 0x3F000000) == 0x1C000000)     // SIMD&FP (literal); PRFM (literal) omitted: relocating a prefetch hint is harmless
+                         ? "literal load" : NULL;
+    if (preloc) die("probe %s+%#llx: original instruction %08x is a pc-relative %s, the probe would keep its target from the slot; pick a neighbouring offset", m->name, (unsigned long long)off, op, preloc);
+    sl[0] = op;                                  // Original instruction
     sl[1] = 0x58000050;                          // ldr x16, #8
     sl[2] = 0xD61F0200;                          // br x16
     *(uint64_t *)(sl + 3) = at + 4;

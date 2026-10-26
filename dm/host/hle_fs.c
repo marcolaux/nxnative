@@ -16,6 +16,7 @@
 #include <stdatomic.h>
 #include <sys/clonefile.h>
 #include <sys/xattr.h>
+#include <time.h>
 
 // Every take-over in this file runs on the big host stack (hle_bigstack.c): path buffers are sized by PATH_MAX and one file open takes 6-7 KB of stack, while a game's save thread can have as little as 8 KB (Super Mario 3D World + Bowser's Fury)
 #undef HLE_FORCE
@@ -589,8 +590,16 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, path, mode, fd);
     return RES_OK;
 }
+// DM_FS_DELAY_US: artificial per-ReadFile latency (usleep), for diagnosing whether a load-time crash depends on how
+// fast host IO completes relative to the game's async loader (Yoshi's Crafted World: UE DeferredFinalizeObjects
+// seeing a not-yet-constructed object). A probe knob, off by default; sleeping scales nothing on hardware except our IO being instant
+static void fs_delay_probe(void) {
+    static long us = -1; if (us < 0) { const char *e = getenv("DM_FS_DELAY_US"); us = e && e[0] ? atol(e) : 0; }
+    if (us > 0) { if (us >= 1000) { struct timespec ts = {us / 1000000, (us % 1000000) * 1000}; nanosleep(&ts, 0); } else usleep((useconds_t)us); }
+}
 HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) {
     if (!h) { *out = 0; return RES_FAIL; }   // a file handle is an fd; 0 is stdin and never a file the game opened: the null handle the game keeps using after a failed open
+    fs_delay_probe();
     size_t got = 0; int reprep = 0;
     dm_guest_write_prepare(buf, sz);   // The destination may be a texture pool page write-protected by the graphics layer: a kernel write to a read-only page returns EFAULT instead of page-faulting, so unprotect and mark dirty first
     while (got < sz) {
