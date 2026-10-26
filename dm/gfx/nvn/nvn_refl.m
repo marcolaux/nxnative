@@ -13,6 +13,8 @@ static void dummy_kind(NSString *t, uint8_t *tt, uint8_t *pf) {
     else if ([t hasPrefix:@"texture3d"]) y = MTLTextureType3D;
     else if ([t hasPrefix:@"texture1d_array"]) y = MTLTextureType1DArray;
     else if ([t hasPrefix:@"texture1d"]) y = MTLTextureType1D;
+    // A buffer image (SPIRV-Cross's texture_buffer<T>: a 1D buffer image) is a texture buffer in Metal, not a 2D one (Unreal's R32 UAVs: Yoshi's Crafted World, compute shader
+    // a94ca5c952ce0d72_b, image slot 0: the guest's NVN texture is a buffer texture, and the host has to bind it as one)
     else if ([t hasPrefix:@"texture_buffer"]) y = MTLTextureTypeTextureBuffer;
     *tt = (uint8_t)y;
     *pf = [t hasPrefix:@"depth"] ? NVN_DPF_DEPTH : [t containsString:@"<uint"] ? NVN_DPF_UINT : [t containsString:@"<int"] ? NVN_DPF_SINT : NVN_DPF_FLOAT;

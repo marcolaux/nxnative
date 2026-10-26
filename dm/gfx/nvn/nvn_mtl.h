@@ -14,6 +14,7 @@ void bf_want_note(const char *key);
 // Memory pool: [mem, mem+size) is expanded outward to page boundaries to build a zero-copy buffer; look up the buffer and offset by GPU address (= CPU address)
 void mtl_pool_add(const void *mem, uint64_t size);
 void mtl_pool_del(const void *mem);
+void mtl_pool_free(const void *mem);   // waits for the committed GPU backlog first: finalizing returns the pool's storage to the game's allocator (mtl_pool_del is the no-wait bookkeeping, for mapping rebuilds at the same pages)
 // memory pool Finalize: evict the textures built on this pool (pool object address) from the storage-sharing table
 void mtl_alias_drop_pool(const void *pool);
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off);   // 1 on success; buf is a (__bridge) id<MTLBuffer>

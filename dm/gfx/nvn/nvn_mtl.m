@@ -469,6 +469,9 @@ static void pool_res(int i) {
     if (g_pools[i].res) return;
     res_add(g_pools[i].buf); res_commit(); g_pools[i].res = 1; g_pool_res_n++;
 }
+static int mtl_wait_at(uint64_t fence, uint64_t timeout_ns, int site);   // declared again below the pool functions' use sites (688)
+static void up_wait_zero(_Atomic int *v, int site);   // same (705)
+static void mtl_pool_log(const char *ev, uint64_t lo, uint64_t hi, uint64_t wait_ns, int timeout);
 void mtl_pool_add(const void *mem, uint64_t size) {
     mtl_init(); g_reg_gen++;
     uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)mem, hi = lo + size;
@@ -497,9 +500,12 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     g_pool_adds++;
     [g_keep addObject:buf];
     pthread_mutex_unlock(&g_mu);
+    mtl_pool_log("pnew", lo, hi, 0, 0);
 }
 
-void mtl_pool_del(const void *mem) {
+// The pool bookkeeping without the GPU drain: the split / join rebuilds of a sparse pool's runs (hle_nvn.c vrun_set) drop and re-own a run's pages at the same addresses without unmapping them, so a
+// pending command buffer's writes land in the same memory through the old or the new buffer alike -- no ordering needed there
+static void pool_del(const void *mem, uint64_t wait_ns, int timeout) {
     g_reg_gen++;
     pthread_mutex_lock(&g_mu);
     // The no-copy buffer goes through deferred release (out of the residency set and unreferenced after submitted commands complete). It used to be removed only from g_keep while the residency set still held a strong reference: after the pool was freed the buffer stayed alive wrapping that guest memory,
@@ -508,11 +514,23 @@ void mtl_pool_del(const void *mem) {
     // autoreleased there, so every finalized pool buffer stayed alive for good (Ghost Trick: Phantom Detective, 125 buffers and 6.6 GB of GPU allocations 300 frames into the boot, 0 with the pool)
     @autoreleasepool {
     for (int i = 0; i < g_npool; i++)
-        if (g_pools[i].key == mem) { id<MTLBuffer> b = g_pools[i].buf; [g_keep removeObject:b]; defer_obj_release(b); if (g_pools[i].res) g_pool_res_n--;
+        if (g_pools[i].key == mem) { id<MTLBuffer> b = g_pools[i].buf; uint64_t lo = g_pools[i].lo, hi = g_pools[i].hi;
+            [g_keep removeObject:b]; defer_obj_release(b); if (g_pools[i].res) g_pool_res_n--;
             if (!g_dead_pools) g_dead_pools = [NSHashTable weakObjectsHashTable];
-            [g_dead_pools addObject:b]; g_pools[i] = g_pools[--g_npool]; g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1); break; }
+            [g_dead_pools addObject:b]; g_pools[i] = g_pools[--g_npool]; g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1);
+            mtl_pool_log("pdel", lo, hi, wait_ns, timeout);
+            break; }
     }
     pthread_mutex_unlock(&g_mu);
+}
+void mtl_pool_del(const void *mem) { pool_del(mem, 0, 0); }
+// nvMemoryPoolFinalize hands the pool's storage -- the game's own memory, whatever MemoryPoolBuilderSetStorage was given -- back to the game's allocator, which during the loading phase recycles the range for its fresh data at once. A driver would not tear the mapping's GPU-side bindings down while
+// command batches were still queued against it; without that ordering the still-pending buffers (atomics included) wrote the game's new allocations instead of the recycled pool: Yoshi's Crafted World's package loader had its object arrays corrupted mid-load by about 2 of 3 direct imga runs. So wait the committed backlog
+// before dropping the pool -- cheap when the GPU is idle, the price of a frame's tail at worst. g_mu is taken after the waits (mtl_wait_at locks it itself); a submission still being recorded cannot reach the pool, the game has already freed it
+void mtl_pool_free(const void *mem) {
+    uint64_t w0 = ws_t0(); int dr = g_fence ? (up_wait_zero(&g_up_pending, WS_DRAIN), mtl_wait_at(g_fence, 5000000000ull, WS_DRAIN)) : 1;
+    if (!dr) MLOG("[RED] pool %p: the GPU is more than 5 s behind its committed work, freeing the pool anyway", mem);
+    pool_del(mem, g_fence ? ws_t0() - w0 : 0, !dr);
 }
 
 // Address → pool: the last hit first, then a binary search over indices sorted by start address, and a full linear scan only when that fails (pools overlapping).
@@ -1412,6 +1430,20 @@ static void post_complete(uint64_t fence, uint64_t c0, uint64_t c1) {
     }
     pthread_mutex_lock(&g_mu); if (fence > g_done) g_done = fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
 }
+static _Atomic int g_consec_cb_err;
+// macOS does not fail a submission it could recover from: a run of "InnocentVictim" errors is the
+// driver having reset this process's queues, after which every submission of the process is ignored
+// (kIOGPUCommandBufferCallbackErrorSubmissionsIgnored). There is nothing to recover into -- the picture
+// is gone for good -- and the loop keeps handing the GPU hundreds of rejected buffers a second for as
+// long as the game runs, which stutters the whole machine the whole time. One failed submission can be
+// ridden through; 32 in a row cannot: stop instead (the cause is the first [RED] error above in the log).
+#define CB_ERR_LIMIT 32
+static void cb_err_tick(int has_error, uint64_t fence, const char *who) {
+    if (!has_error) { atomic_store(&g_consec_cb_err, 0); return; }
+    int n = atomic_fetch_add(&g_consec_cb_err, 1) + 1;
+    if (n == CB_ERR_LIMIT)
+        MDIE("[RED] %d consecutive failed command buffer submissions (fence %llu, %s segment): the GPU driver reset this process's queues and ignores every further submission, so there is no state to run on; stopping here keeps the machine responsive", n, (unsigned long long)fence, who);
+}
 uint64_t mtl_sub_commit(void) {
     lc_land();   // clears still waiting (the command list ends with them)
     defer_fallback();   // Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
@@ -1440,6 +1472,7 @@ uint64_t mtl_sub_commit(void) {
         gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
         if (ws_on()) ws_fb(fence, cb.GPUEndTime);
         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
+        cb_err_tick(cb.error != nil, fence, "graph");
         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
         post_complete(fence, c0, c1);
         defer_drain();
@@ -2529,6 +2562,11 @@ static inline int passdump(void) {
 }
 // The next n frames' passes, on request (the Mac's DM_CTL "passdump n", hle_hid.c): for a scene that a fixed DM_NVN_PASSDUMP frame range cannot be timed to
 void dm_gfx_passdump_next(long n) { long f = (long)atomic_load(&g_cur_frame); g_pd_a1 = f + n; g_pd_a0 = f + 1; }
+// Pool lifecycle (mtl_pool_add / mtl_pool_del / mtl_pool_free): one fprintf per line -- the game's threads finalize pools while the submit thread writes its pass lines through the same stderr, and two fprintf calls interleave mid-line (the crash dumps lost their register values that way)
+static void mtl_pool_log(const char *ev, uint64_t lo, uint64_t hi, uint64_t wait_ns, int timeout) {
+    char ln[208] = ""; int m = snprintf(ln, sizeof ln, "[dm] [nvn-mtl] %s f%llu range %#llx..%#llx", ev, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)lo, (unsigned long long)hi); size_t n = m > 0 && (size_t)m < sizeof ln - 1 ? (size_t)m : sizeof ln - 2;
+    if (timeout) n += (size_t)snprintf(ln + n, sizeof ln - n, " TIMEOUT"); else if (wait_ns) n += (size_t)snprintf(ln + n, sizeof ln - n, " gpu-wait %llu us", (unsigned long long)(wait_ns / 1000));
+    snprintf(ln + n, sizeof ln - n, "\n"); fprintf(stderr, "%s", ln); }
 #define PD(...) do { if (passdump()) { fprintf(stderr, "[pass] F%llu ", (unsigned long long)atomic_load(&g_cur_frame)); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 static void blit_note(void) { if (g_enc) PD("E %llu copy / buffer update ends the render pass", g_stat_pass); }
 __attribute__((weak)) void dm_guest_frame_tick(void) {}   // hle_os.c provides the strong definition (DM_DETCLOCK deterministic guest clock); a no-op when graphics unit tests do not link the host   // diag.c provides the strong definition (DM_TICK_HOLD=E:SHOT unfreeze); a no-op when graphics unit tests do not link the host
@@ -3908,7 +3946,7 @@ static inline __attribute__((always_inline)) void *tex_fast(int tid) {
 // The texture type the shader declares differs from the one the descriptor gives: use a compatible view. Maxwell sample instructions carry their own dimension, and a non-array instruction reading a 2D array texture reads layer 0;
 // on Metal a 2D array bound to a texture2d argument is a type mismatch with undefined reads (measured: one fixed value). Super Mario 3D World + Bowser's Fury creates its pre-lighting buffer as a one-layer 2D array
 // and the deferred lighting shader samples it as 2D: the ambient light of the whole picture became one colour, washed out white. Supports 2D array <-> 2D and 2D array -> cube / cube array; any other mismatch is reported once. Caller holds g_rmu
-static id<MTLTexture> dummy_tex(int dtt, int dpf); static uint64_t g_dummy_tex_rid[8][4];
+static id<MTLTexture> dummy_tex(int dtt, int dpf); static uint64_t g_dummy_tex_rid[16][4];
 static id<MTLTexture> tex_fit(int tid, id<MTLTexture> t, MTLTextureType want, uint64_t *rid) {
     MTLTextureType have = t.textureType; NSUInteger ns = 0;
     if (want == MTLTextureType2D && have == MTLTextureType2DArray) ns = 1;
@@ -3923,7 +3961,7 @@ static id<MTLTexture> tex_fit(int tid, id<MTLTexture> t, MTLTextureType want, ui
         // Uniform-controlled branches can leave unused cube inputs holding 2D descriptors (Echoes of Wisdom).
         // Binding alone cannot establish that a mismatched input is sampled; this supported fallback is informational.
         static int noted; if (!noted++) MLOG("cube binding fallback: texture ID %d has a 2D descriptor; zero cube bound (the shader may leave this input unused)", tid);
-        id<MTLTexture> z = dummy_tex((int)want, NVN_DPF_FLOAT); *rid = g_dummy_tex_rid[want & 7][NVN_DPF_FLOAT]; return z; }
+        id<MTLTexture> z = dummy_tex((int)want, NVN_DPF_FLOAT); *rid = g_dummy_tex_rid[want & 15][NVN_DPF_FLOAT]; return z; }
     if (!ns || tid <= 0 || tid >= g_ntreg) return nil;   // no view bridges it: the caller reports it (tex_mis_note)
     treg_t *r = &g_treg[tid];
     if (r->alt && r->alt_of == (__bridge void *)t && r->alt_type == (uint8_t)want) { *rid = r->alt_rid; return (__bridge id<MTLTexture>)r->alt; }
@@ -5765,29 +5803,45 @@ static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
 }
 // Argument buffer: filled item by item per the B reflection (uniform slot r, separate texture / sampler slot r, storage buffer slot r, driver segments c0 / c2, c1, support_buffer)
 // Unbound resources read 0: give all-zero dummy resources (NVN descriptors 0..255 are reserved for the driver; the game binding handle 0 means 'this slot is empty')
-static uint64_t g_dummy_img_rid[8][4], g_dummy_tbuf_rid[4];
+static uint64_t g_dummy_img_rid[16][4], g_dummy_tbuf_rid[4];
+// A buffer image (the MSL type texture_buffer<T>) is a texture buffer in Metal: the dummy of that type is one too, over the zero buffer (its element count is what the shader's
+// get_width() sees)
+static id<MTLBuffer> dummy_buf(void);
+static id<MTLTexture> dummy_buf_tex(int dtt, int dpf) {
+    static __strong id<MTLTexture> cache[16][4];
+    id<MTLTexture> t = cache[dtt & 15][dpf & 3]; if (t) return t;
+    id<MTLBuffer> b = dummy_buf();
+    MTLPixelFormat pf = dpf == NVN_DPF_UINT ? MTLPixelFormatR32Uint : dpf == NVN_DPF_SINT ? MTLPixelFormatR32Sint : MTLPixelFormatR32Float;
+    // A texture buffer cannot be written by a shader (Metal has no writable texture buffer): the dummy is a read-only one, like every other unbound slot
+    MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:pf width:b.length / 4 resourceOptions:b.resourceOptions usage:MTLTextureUsageShaderRead];
+    t = [b newTextureWithDescriptor:d offset:0 bytesPerRow:b.length];
+    if (!t) { RED_ONCE(120, "cannot create the dummy texture buffer of an unbound image slot"); return nil; }
+    cache[dtt & 15][dpf & 3] = t; res_add(t); return t;
+}
 static id<MTLTexture> dummy_tex(int dtt, int dpf) {
-    static __strong id<MTLTexture> cache[8][4];
+    static __strong id<MTLTexture> cache[16][4];
     MTLTextureType tt = (MTLTextureType)dtt;
+    if (tt == MTLTextureTypeTextureBuffer) { id<MTLTexture> t = dummy_buf_tex(dtt, dpf); if (t) { g_dummy_tex_rid[dtt & 15][dpf & 3] = t.gpuResourceID._impl; } return t; }
     MTLPixelFormat pf = dpf == NVN_DPF_DEPTH ? MTLPixelFormatDepth32Float : dpf == NVN_DPF_UINT ? MTLPixelFormatRGBA32Uint : dpf == NVN_DPF_SINT ? MTLPixelFormatRGBA32Sint : MTLPixelFormatRGBA8Unorm;
-    id<MTLTexture> t = cache[dtt & 7][dpf & 3];
+    id<MTLTexture> t = cache[dtt & 15][dpf & 3];
     if (t) return t;
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
     d.textureType = tt; d.pixelFormat = pf; d.width = d.height = d.depth = 1; d.storageMode = MTLStorageModeShared; d.usage = MTLTextureUsageShaderRead;
     t = [g_dev newTextureWithDescriptor:d];   // Shared storage is all zeros when newly created
     if (pf != MTLPixelFormatDepth32Float) { uint8_t z[64] = {0}; NSUInteger faces = tt == MTLTextureTypeCube || tt == MTLTextureTypeCubeArray ? 6 : 1;
         for (NSUInteger f = 0; f < faces; f++) [t replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:f withBytes:z bytesPerRow:16 bytesPerImage:16]; }
-    cache[dtt & 7][dpf & 3] = t; g_dummy_tex_rid[dtt & 7][dpf & 3] = t.gpuResourceID._impl; res_add(t);
+    cache[dtt & 15][dpf & 3] = t; g_dummy_tex_rid[dtt & 15][dpf & 3] = t.gpuResourceID._impl; res_add(t);
     return t;
 }
 // Write sink for unbound image slots: kept separate from the dummy textures that read 0 (writes must not pollute them); one is shared per same type and same pixel class
 static id<MTLTexture> dummy_img(int dtt, int dpf) {
-    static __strong id<MTLTexture> cache[8][4];
-    id<MTLTexture> t = cache[dtt & 7][dpf & 3]; if (t) return t;
+    static __strong id<MTLTexture> cache[16][4];
+    if ((MTLTextureType)dtt == MTLTextureTypeTextureBuffer) { id<MTLTexture> t = dummy_buf_tex(dtt, dpf); if (t) { g_dummy_img_rid[dtt & 15][dpf & 3] = t.gpuResourceID._impl; } return t; }
+    id<MTLTexture> t = cache[dtt & 15][dpf & 3]; if (t) return t;
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
     d.textureType = (MTLTextureType)dtt; d.pixelFormat = dpf == NVN_DPF_UINT ? MTLPixelFormatRGBA32Uint : dpf == NVN_DPF_SINT ? MTLPixelFormatRGBA32Sint : MTLPixelFormatRGBA16Float;
     d.width = d.height = d.depth = 1; d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    t = [g_dev newTextureWithDescriptor:d]; cache[dtt & 7][dpf & 3] = t; g_dummy_img_rid[dtt & 7][dpf & 3] = t.gpuResourceID._impl; res_add(t); return t;
+    t = [g_dev newTextureWithDescriptor:d]; cache[dtt & 15][dpf & 3] = t; g_dummy_img_rid[dtt & 15][dpf & 3] = t.gpuResourceID._impl; res_add(t); return t;
 }
 static id<MTLBuffer> dummy_buf(void);
 static id<MTLTexture> dummy_tbuf(int dpf) {   // Unbound typed buffer: all zeros (pixel class matches the shader's texture_buffer<T>)
@@ -5838,7 +5892,7 @@ static id<MTLTexture> img_binding(int tid, const nvn_rbind *b, uint64_t *rid, in
         if (v) { t = v; *rid = r2; } else if (swz_only) t = nil;
     }
     *real = t != nil;
-    if (!t) { t = dummy_img(b->dtt, b->dpf); *rid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }
+    if (!t) { t = dummy_img(b->dtt, b->dpf); *rid = g_dummy_img_rid[b->dtt & 15][b->dpf & 3]; }
     return t;
 }
 static int imga_extent(id<MTLTexture> t, const nvn_rbind *b, uint64_t *bytes) {
@@ -5846,6 +5900,14 @@ static int imga_extent(id<MTLTexture> t, const nvn_rbind *b, uint64_t *bytes) {
     if (t.textureType != MTLTextureTypeTextureBuffer && t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray) return 0;
     return nvn_imga_bytes(t.width, t.textureType == MTLTextureTypeTextureBuffer ? 1 : t.height,
                           t.textureType == MTLTextureType2DArray ? t.arrayLength : 1, bytes);
+}
+// Why the check above refused a bound image (the check is fail-closed, so the reason belongs in the log)
+static const char *imga_extent_why(id<MTLTexture> t, const nvn_rbind *b) {
+    if (!t) return "no texture";
+    if (t.textureType != (MTLTextureType)b->dtt) return "the texture's type is not the one the shader declares";
+    if (t.sampleCount > 1) return "the texture is multisampled";
+    if (t.textureType != MTLTextureTypeTextureBuffer && t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray) return "the texture is neither a buffer, a 2D nor a 2D array texture";
+    return "the extent does not fit";
 }
 // Snapshot substitution for same-pass feedback sampling (registered by fb_prepare, used by encode_args; see the notes before draw)
 static uint64_t g_draw_seq, g_fb_seq, g_fb_count; static int g_fb_n, g_fb_rebind;
@@ -5974,7 +6036,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 int tid = ubo_tex_id(ubo_handle(nvn_stage, reg, 8 * k)); if (tid >= g_ntreg || !g_treg[tid].ok) tid = 0;   // as for the samplers: other data, not a handle
                 void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
                 if (t && t.textureType != (MTLTextureType)b->dtt) { uint64_t r2 = 0; id<MTLTexture> v = tex_fit_elem(tid, t, (MTLTextureType)b->dtt, &r2); t = v; trid = v ? r2 : 0; }   // a handle the shader does not pick here may be another kind
-                if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; } else real |= 1ull << k;
+                if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 15][b->dpf & 3]; } else real |= 1ull << k;
                 if (bl && tid) PD("B %llu st%d texu [%d] tid=%d %s", g_stat_pass, nvn_stage, k, tid, tv ? "real" : "dummy");
                 slots[aid + k] = trid;
                 USE(t, MTLResourceUsageRead);
@@ -6003,7 +6065,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 // no view fits, and one side is a buffer texture (Octopath Traveler 0: a buffer texture left in a slot a shader reads as a cube): reads of it are undefined, so the slot reads 0
                 else if (t.textureType == MTLTextureTypeTextureBuffer || (MTLTextureType)b->dtt == MTLTextureTypeTextureBuffer) { tex_mis_note(sh, nvn_stage, b->kind == NVN_RB_TEX ? reg : -1, tid, t, (MTLTextureType)b->dtt, "a buffer texture: the slot reads 0 (dummy)"); t = nil; }
                 else tex_mis_note(sh, nvn_stage, b->kind == NVN_RB_TEX ? reg : -1, tid, t, (MTLTextureType)b->dtt, "bound as is"); }
-            if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
+            if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 15][b->dpf & 3]; }
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_IMG) {   // Writable texture: NVN image slot r (BindImages) ↔ D3D u_r
@@ -6019,10 +6081,17 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             const tex_t *tt = tid && tid < g_ntreg && g_treg[tid].ok ? &g_treg[tid].t : NULL;
             id<MTLTexture> image = atomic_img[reg]; uint64_t need;
             if (!imga_extent(image, atomic_desc[reg], &need))
-                MDIE("[RED] image atomics: unsupported or overflowing IMG extent (shader %s stage %d slot %d texture %d)", sh->key, nvn_stage, reg, tid);
+                MDIE("[RED] image atomics: unsupported or overflowing IMG extent (shader %s stage %d slot %d texture %d: %s; Metal type %d, the shader declares %d, %lux%lux%lu, samples %d)",
+                     sh->key, nvn_stage, reg, tid, imga_extent_why(image, atomic_desc[reg]), (int)image.textureType, (int)atomic_desc[reg]->dtt,
+                     (unsigned)image.width, (unsigned)image.height, (unsigned)image.arrayLength, (int)image.sampleCount);
             if (tt && (!atomic_real[reg] || (image.pixelFormat != MTLPixelFormatR32Uint && image.pixelFormat != MTLPixelFormatR32Sint)))
                 MDIE("[RED] image atomics: real image is not a resolved R32 integer IMG (shader %s stage %d slot %d texture %d)", sh->key, nvn_stage, reg, tid);
-            int linear = tt && (tt->d.target == NVN_TEXTURE_TARGET_BUFFER || (tt->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)));
+            // DM_NVN_IMGA_SCRATCH: force every image-atomic bind through the scratch buffer, so no GPU
+            // write lands in guest memory (diagnostic: a run that survives the loading-phase corruption
+            // then points at a guest-memory write the direct path made; the game's GPU-side result of the
+            // shaders is stale either way, only the destination of their atomics changes)
+            static int g_imga_scratch = -1; if (g_imga_scratch < 0) g_imga_scratch = !!getenv("DM_NVN_IMGA_SCRATCH");
+            int linear = tt && !g_imga_scratch && (tt->d.target == NVN_TEXTURE_TARGET_BUFFER || (tt->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)));
             id<MTLBuffer> storage = nil; uint64_t gpu = 0;
             if (linear) {
                 void *mb = NULL; uint64_t mo = 0;
@@ -6072,10 +6141,10 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                     if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
                 } else {
                     if (t && t.textureType != (MTLTextureType)b->dtt) { uint64_t r2 = 0; id<MTLTexture> v = tex_fit_elem(tid, t, (MTLTextureType)b->dtt, &r2); t = v; trid = v ? r2 : 0; }
-                    if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
+                    if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 15][b->dpf & 3]; }
                 }
                 if (bl && tid) PD("B %llu st%d texd [%d] tid=%d %s", g_stat_pass, nvn_stage, k, tid, tv ? "real" : "dummy");
-                if (tv && trid && trid != g_dummy_tbuf_rid[b->dpf & 3] && trid != g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]) real |= 1ull << k;
+                if (tv && trid && trid != g_dummy_tbuf_rid[b->dpf & 3] && trid != g_dummy_tex_rid[b->dtt & 15][b->dpf & 3]) real |= 1ull << k;
                 slots[aid + k] = trid;
                 USE(t, MTLResourceUsageRead);
             }
@@ -6087,7 +6156,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 int tid = (int)(c2_handle(nvn_stage, b->off + 8u * k) & 0xfffff);
                 void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
                 if (t && t.textureType != (MTLTextureType)b->dtt) { uint64_t r2 = 0; id<MTLTexture> v = tex_fit_elem(tid, t, (MTLTextureType)b->dtt, &r2); t = v; trid = v ? r2 : 0; }   // an element the shader does not pick here may be another kind
-                if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; } else real |= 1ull << k;
+                if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 15][b->dpf & 3]; } else real |= 1ull << k;
                 if (bl && tid) PD("B %llu st%d texa [%d] tid=%d %s", g_stat_pass, nvn_stage, k, tid, tv ? "real" : "dummy");
                 slots[aid + k] = trid;
                 USE(t, MTLResourceUsageRead);
@@ -9223,6 +9292,7 @@ static void sub_cut(void) {
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
         gpu_tag_done(f, cb.GPUStartTime, cb.GPUEndTime);
         if (sc) { if (k < SEG_CLK_N) { atomic_store(&sc->t[k][0], gpu_s_guest_ns(cb.GPUStartTime)); atomic_store(&sc->t[k][1], gpu_s_guest_ns(cb.GPUEndTime)); } seg_clk_put(sc); }
+        cb_err_tick(cb.error != nil, f, "cut");
         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int k; if (k++ < 8) MLOG("[RED] segment command buffer execution error: %s", cb.error.description.UTF8String); }
     }];
     res_commit();
