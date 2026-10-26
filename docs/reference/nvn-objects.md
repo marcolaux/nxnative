@@ -88,6 +88,13 @@ The game may also write into an NVN object directly, without an NVN call, throug
 - **Fix:** `mtl_pool_del`, `res_add_at` and `res_remove` (`nvn_mtl.m`) each have their own `@autoreleasepool`, as `defer_drain` and the memory line's count already did ([Deferred-release drain without an autorelease pool](memory.md#deferred-release-drain-without-an-autorelease-pool)).
 - **Found on:** [Ghost Trick: Phantom Detective](../../dm/games/010029B018432000/README.md): 0 buffers freed but alive with the fix; GPU allocated 1.7 GB instead of 8.3 GB 300 frames into the boot and 2.9 GB instead of 9.9 to 11.7 GB in Chapter 1, resident memory, frame times and pictures unchanged (zero-copy buffers add no memory of their own). [Pokémon Sword](../../dm/games/0100ABF008968000/README.md): 8 to 0 at the title after 90 s. Earlier Mac logs show the count in most games, growing with play: Animal Crossing: New Horizons 3,113 after 27,900 frames, Pokémon Sword 2,050, Super Smash Bros. Ultimate 1,279, Pokémon Legends: Z-A 932 (small pools there: 100 to 300 MB).
 
+### A finalized pool's memory reused while the GPU still writes to it
+
+- **Symptom:** the game's own data is corrupted in the middle of a loading phase: object arrays hold values from the previous use of the memory, and the scene shows the wrong objects. The corruption moves between runs and appears only with a direct image atomic.
+- **Cause:** `nvMemoryPoolFinalize` hands the pool's storage -- the game's own memory, whatever `MemoryPoolBuilderSetStorage` was given -- back to the game's allocator, which during the loading phase recycles the range for its fresh data at once. A driver would not tear the mapping's GPU-side bindings down while command batches were still queued against it: the still-pending buffers, image atomics included, then wrote the game's new allocations instead of the recycled pool.
+- **Fix:** `mtl_pool_free` waits for the committed backlog before the pool's memory is released (`nvn_mtl.m`; `nvnMemoryPoolFinalize` and the virtual pool's release call it, and the wait is reported as `pnew` / `pdel` lines with the time waited). The old `mtl_pool_del` stays the no-wait bookkeeping, for the split and join rebuilds of a sparse pool's runs, which drop and re-own a run's pages at the same addresses.
+- **Found on:** [Yoshi's Crafted World](../../dm/games/01006000040C2000/README.md): its object arrays were corrupted mid-load by about 2 of 3 direct image-atomic runs.
+
 ### Memory-pool tracking table grows in blocks
 
 - **Cause:** the memory-pool tracking table had a fixed 4,096 slots; a pool past the end would have its textures re-uploaded at every use.

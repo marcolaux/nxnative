@@ -329,6 +329,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md): 331 of 9,043 pairs failed; the opening course used none of them, later levels did (about 11,500 failed builds in one 11-minute session).
 - **Check:** check all pairs offline after a build (recipe in [05](../agents/05-debugging.md)).
 
+### A vertex shader built before its pixel shader
+
+- **Symptom:** after a chain change (every shader rebuilt), the host reports `[RED] pipeline prebuild: the base of <vertex key> + <pixel key> failed: Fragment input(s) user(locnN) mismatching vertex shader output type(s) or not written by vertex shader` for a pair, and the scene that draws it is wrong.
+- **Cause:** `vs_pad` gives a vertex shader the outputs its pixel shaders read, and it reads their MSL from the build's output directory. `dmsh_build.py` finished the two groups of shaders in one thread pool: `ex.map` submits a whole group at once, and both groups were submitted together, so they ran at the same time and a vertex shader could be built before its pixel shader had written its MSL. The padding was then empty and the pair did not link. It hit every build that rebuilt all shaders, and only the pairs whose vertex shader came first.
+- **Fix:** the build is two phases: the paired vertex shaders are submitted only when the first group is done (`dmsh_build.py`, the `fin` phase), as [Pixel shader inputs the vertex shader does not write](#pixel-shader-inputs-the-vertex-shader-does-not-write) describes.
+- **Found on:** [Yoshi's Crafted World](../../dm/games/01006000040C2000/README.md#rendering): the pair `0a0113d0324a92e1` + `4c0ccf65900cd32c` (14 outputs missing) in the chain b-8393d85a4eae.
+
 ### Single-stage programs paired with a cover
 
 - **Cause:** a game that builds one NVN program per GLSLC output and combines vertex and pixel programs per draw with `BindProgram` stage bits has its real pairs only at draw time, so the offline build cannot know which pixel shaders a vertex shader must feed.
@@ -644,7 +651,7 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 ### Bounded MSL 2.3 atomic emulation
 
-- **Symptom:** Metal shader validation reports invalid image-atomic stores even with an image-sized scratch buffer; without validation, GPU page faults can freeze rendering.
+- **Symptom:** Metal shader validation reports invalid image-atomic stores even with an image-sized scratch buffer; without validation, GPU page faults can freeze rendering. A shader that reads an image atomic's return value does not load at all: the log repeats `[RED] failed to load shader <key>_b` and `the dispatched program has no compute shader (or it is not mapped)`, and the scene draws into its render targets but the present shows the UI over a black background.
 - **Cause:** the translator lost the surface instruction's `IGN` bounds mode before lowering an image atomic to a raw buffer pointer. Scratch capacity cannot protect against invalid coordinates; the upstream 2D coordinate helper also omits array layers.
 - **Fix:** preserve the supported bounds mode, guard every coordinate before pointer construction, use layer-aware 64-bit addressing, and validate the matching image and buffer's layout and capacity before binding. The supported contract and tests are described below.
 - **Found on:** [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md#rendering), with the development-build report and remaining gameplay validation recorded there.
@@ -674,7 +681,12 @@ semantics ([ARB_shader_image_load_store, issue 30](https://registry.khronos.org/
 invalid coordinates leave memory unchanged and return zero. Found on
 [SHIN MEGAMI TENSEI V: Vengeance](../../dm/games/010069C01AB82000/README.md), whose
 two buffer-image counter shaders were dispatched at boot but rejected because
-they consume their returned values. `test_image_atomic_bounds.py` keeps that
+they consume their returned values. Found on
+[Yoshi's Crafted World](../../dm/games/01006000040C2000/README.md#rendering):
+its Unreal Engine 4 light-grid compute shaders (`f0b33a6b4f3cc64f`,
+`572c1b843ca32afb`, `8dbd4ee9b3da30d4`) read the atomic's return value, and
+the level was black under the UI while they failed to load.
+`test_image_atomic_bounds.py` keeps that
 value live through a second atomic, validates the SPIR-V dataflow and both Metal
 SDKs, and optionally executes the buffer fixtures on a Mac GPU
 (`DMSH_TEST_GPU=1`, `t_atomic_return.m`): valid coordinates return the old value,
@@ -698,7 +710,10 @@ Changing this path invalidates the chain and shader cache. Rebuild the translato
 and record its actual fingerprints before preparing shaders again; a host-only
 rebuild is insufficient. The synthetic regression is
 `dm/tools/tests/test_image_atomic_bounds.py`: portable helper/algebra checks plus
-an opt-in rebuilt-translator → SPIR-V validation → MSL 2.3 check. Set
+an opt-in rebuilt-translator → SPIR-V validation → MSL 2.3 check. The case of an
+atomic whose result the source reads has its own test
+(`test_returning_result_merged`): the result is a Phi at the merge block, with a
+constant 0 on the skipped out-of-bounds edge. Set
 `DMSH_TEST_XLATE` to the rebuilt translator, with `spirv-val` and `spirv-cross` on
 `PATH`; `DMSH_TEST_METAL=1` also compiles and links with Apple's Metal compiler.
 Set `DMSH_TEST_METAL_SDKS=macosx,iphoneos` to check both SDKs.
